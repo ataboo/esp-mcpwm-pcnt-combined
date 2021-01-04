@@ -14,6 +14,8 @@ static const char* TAG = "PWM_STEP_TEST";
 #define TICK_PIN GPIO_NUM_18
 #define DIR_PIN GPIO_NUM_19
 
+// Define USE_LOOPBACK to use a separate "loopback" GPIO pin count TICK_PIN's output.
+// This requires physically shorting GPIO_18 to GPIO_5.
 // #define USE_LOOPBACK
 #ifdef USE_LOOPBACK
     #define PCNT_PIN GPIO_NUM_5
@@ -30,12 +32,14 @@ static const char* TAG = "PWM_STEP_TEST";
 static QueueHandle_t isr_queue;
 static pcnt_isr_handle_t counter_isr_handle;
 
+// Recieve interrupts from PCNT events and push to `isr_queue`
 static void IRAM_ATTR counter_isr(void* args) {
     int8_t val = 0;
     xQueueSendFromISR(isr_queue, &val, NULL);
     PCNT.int_clr.val = 1ULL<<PCNT_UNIT;
 }
 
+// Print the current step when a value is received from `isr_queue`
 static void read_task(void* args) {
     int8_t val;
     int16_t count;
@@ -44,7 +48,6 @@ static void read_task(void* args) {
         xQueueReceive(isr_queue, &val, portMAX_DELAY);
 
         if (val < 0) {
-
             ESP_LOGI(TAG, "Read task quit signal received.");
             break;
         }
@@ -55,6 +58,8 @@ static void read_task(void* args) {
     vTaskDelete(NULL);
 }
 
+// Print the values of the registers relevant to MCPWM and PCNT on the tick and dir pins.
+// `GPIOxx` registers will need to be changed if you switch pins.
 static void dump_regs(const char* message) {
     ESP_LOGI(TAG, "%s", message);
     ESP_LOGI(TAG, "GPIO en    | FUNC43     | FUNC18     | MUX 18     | MUX 19     | FUNC 45");
@@ -66,6 +71,7 @@ static void dump_regs(const char* message) {
     );
 }
 
+// Print the current step count.
 static void dump_count(const char* message) {
     int16_t count;
     pcnt_get_counter_value(PCNT_UNIT, &count);
@@ -122,8 +128,11 @@ static void init_pcnt() {
     pcnt_event_enable(PCNT_UNIT, PCNT_EVT_THRES_1);
 
     pcnt_counter_pause(PCNT_UNIT);
+
+    // This needs to be called on init or count will stay at 0!
     pcnt_counter_clear(PCNT_UNIT);
 
+    // Register the counter interrupt handler.
     pcnt_isr_register(counter_isr, NULL, 0, &counter_isr_handle);
     pcnt_intr_enable(PCNT_UNIT);
 
@@ -134,29 +143,42 @@ static void init_pcnt() {
 
 }
 
+// Change registry values so that TICK and DIR pin can serve as output for MCPWM and input for PCNT.
+// This should remove the setup's order dependancy, 
+// i.e setting up PCNT after MCPWM, clears some output setup and vice-versa.
 static void fix_regs(uint16_t pulse_signal) {
+    // Enable both pins as output.
     REG_SET_BIT(GPIO_ENABLE_REG, (1ULL<<TICK_PIN|1ULL<<DIR_PIN));
+    
+    // Enable input on direction pin mux.
     PIN_INPUT_ENABLE(GPIO_PIN_MUX_REG[DIR_PIN]);
 
 #ifndef USE_LOOPBACK
+    // Connect MCPWM pulse signal to TICK output in-case MCPWM is setup before TICK is registered as an input.
     gpio_matrix_out(TICK_PIN, pulse_signal, 0, 0);
+
+    // Enable TICK as input in GPIO mux.
     PIN_INPUT_ENABLE(GPIO_PIN_MUX_REG[TICK_PIN]);
 #endif
 }
 
 static void dispose() {
+    // Send quit value to read task.
     int8_t quit_val = -1;
     xQueueSend(isr_queue, &quit_val, portMAX_DELAY);
 
+    // Dispose PCNT
     pcnt_counter_pause(PCNT_UNIT);
     pcnt_intr_disable(PCNT_UNIT);
     pcnt_isr_unregister(counter_isr_handle);
 }
 
 static void init() {
+    // Create the queue and start the read task pinned to core.
     isr_queue = xQueueCreate(10, sizeof(int8_t));
     xTaskCreatePinnedToCore(read_task, "pcnt-read-task", 2048, NULL, 1, NULL, 1);
 
+    // If `fix_regs` is doing its job, the order of `init_dir`, `init_pcnt`, and `init_mcpwm` should be interchangable.
     dump_regs("Before setup");
     
     init_dir();
@@ -176,7 +198,9 @@ static void step_and_wait(bool forward, int delay_ms) {
     gpio_set_level(DIR_PIN, (uint32_t)forward);
     mcpwm_set_duty(MCPWM_UNIT, MCPWM_TIMER, MCPWM_GEN_A, 10.0f);
     mcpwm_start(MCPWM_UNIT, MCPWM_TIMER);
+
     vTaskDelay(3000/portTICK_PERIOD_MS);
+    
     mcpwm_stop(MCPWM_UNIT, MCPWM_TIMER);
 }
 
